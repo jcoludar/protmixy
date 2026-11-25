@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from src.utils import msat_output
 
 # load the generator + alphabet
-msa_transformer, msa_alphabet = ModelLoader.get_model()
+msa_transformer, msa_alphabet = ModelLoader.get_msa_model()  # the MSA arm explicitly: this script reads whole alignments
 msa_batch_converter = msa_alphabet.get_batch_converter()
 idx_list = msa_alphabet.tok_to_idx # reference dict for model token
 aa_list  = {v: k for k,v in idx_list.items()}

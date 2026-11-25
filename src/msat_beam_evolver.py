@@ -17,24 +17,65 @@ import random
 from tqdm import tqdm
 from pysam import FastaFile
 from src.utils.model_loader import ModelLoader
+from src.utils import esm2_backend
 from config.settings import ANNEAL_TEMP, TEMP_DECAY, ANNEAL_TEMP_MIN,\
-      STOP_TOL_FACTOR, DEVICE, N_BEAM, N_TOSS, GENERATOR_METHOD, P_MASK
+      STOP_TOL_FACTOR, DEVICE, N_BEAM, N_TOSS, GENERATOR_METHOD, P_MASK,\
+      GENERATOR_BACKEND, SELECTION_BACKEND, ESM2_MODEL_NAME, GENERATOR_MODEL_NAME,\
+      hyperparameters_matched, hyperparameter_deviations
 from src.utils.helpers import (
     create_msa_for_iterative_sampling, msa_query_sample,
     mask_sequence, eval_candidate_pathway, decode_token_to_aa,
-    generate_pathway_mask, tokens_changed, accept_or_reject_beam_candidates, 
+    generate_pathway_mask, tokens_changed, accept_or_reject_beam_candidates,
     accept_or_reject_iteration_candidates, assemble_paths, get_row_col_attention, apply_apc, validate_path_consistency)
 import pickle
 
-# load the generator + alphabet
-msa_transformer, msa_alphabet = ModelLoader.get_model()
+# The alphabet only -- no checkpoint is read here. The generator loads lazily
+# inside `msa_query_sample`, which is what lets the ESM-2 arm run without an
+# MSA-Transformer checkpoint on disk.
+msa_alphabet = ModelLoader.get_alphabet()
 msa_batch_converter = msa_alphabet.get_batch_converter()
 idx_list = msa_alphabet.tok_to_idx # reference dict for model token
 aa_list  = {v: k for k,v in idx_list.items()}
-valid_aa_vals = torch.tensor([ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 
+valid_aa_vals = torch.tensor([ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
                              18, 19, 20, 21, 22, 23, 30],dtype=torch.int64)
 
+#: Columns of the per-step degeneracy table. Perplexity alone cannot read
+#: degeneracy -- a collapsed beam scores BETTER on it -- so diversity, the
+#: longest homopolymer run and the repeated-3mer fraction are reported beside it.
+DEGENERACY_COLUMNS = (
+    'iteration', 'beam', 'n_candidates', 'diversity', 'max_homopolymer_run',
+    'repeat_3mer_fraction', 'n_masked', 'n_changed', 'n_changed_unmasked',
+)
+
+
+def _degeneracy_row(iteration, beam_idx, sequences, n_masked, n_changed, n_changed_unmasked):
+    if not sequences:
+        return None
+    return (
+        iteration, beam_idx, len(sequences),
+        round(esm2_backend.step_diversity(sequences), 6),
+        max(esm2_backend.max_homopolymer_run(s) for s in sequences),
+        round(max(esm2_backend.repeat_kmer_fraction(s) for s in sequences), 6),
+        n_masked, n_changed, n_changed_unmasked,
+    )
+
 def iterative_sampling(full_context_file, starting_seq_name, ending_seq_name, context_msa_file, random_seed, n_iter, p_mask, output_file_path):
+
+    generator_name = ESM2_MODEL_NAME if GENERATOR_BACKEND == 'esm2' else GENERATOR_MODEL_NAME
+    print(f"🧪 ARM: generator={GENERATOR_BACKEND} ({generator_name}), selection={SELECTION_BACKEND}")
+    if not hyperparameters_matched():
+        print(f"🚨 NOT THE MATCHED BENCHMARK: {hyperparameter_deviations()}")
+
+    if GENERATOR_BACKEND == 'esm2' and GENERATOR_METHOD == 'apc':
+        # ESM-2's `attentions` is single-sequence self-attention; the MSA
+        # Transformer's `row_attentions` is tied attention pooled over MSA
+        # depth. They are dimensionally swappable and semantically different,
+        # so an ESM-2 APC arm is an ablation to design, not a port to assume.
+        raise NotImplementedError(
+            "GENERATOR_METHOD='apc' with the ESM-2 backend is not implemented: "
+            "row_attentions (tied, over MSA depth) and attentions (single-sequence "
+            "self-attention) are not the same quantity. Use GENERATOR_METHOD='irs'."
+        )
 
     # Seed the sampler
     torch.manual_seed(random_seed)
@@ -97,6 +138,13 @@ def iterative_sampling(full_context_file, starting_seq_name, ending_seq_name, co
     stop_tol = STOP_TOL_FACTOR * total_dist_to_target
     print(f" 📊 Cosine distance to target is {total_dist_to_target} and stop tolerance is set to {stop_tol}.")
 
+    # Per-step degeneracy table. Iterative masked-pLM filling collapsing to
+    # repetitive sequence is the main scientific risk of this arm, and a
+    # collapsed run that is only reported as a worse score reads as a second
+    # weak comparator rather than as the mechanism it is.
+    degeneracy_file = f"{output_file_path}degeneracy_{GENERATOR_BACKEND}_{random_seed}.tsv"
+    degeneracy_rows = []
+
     # Main iterative search loop
     for it in tqdm(range(1, n_iter), desc="Processing", unit="step"): 
         print(f"🏹 Starting Iteration: {it}.")
@@ -137,6 +185,11 @@ def iterative_sampling(full_context_file, starting_seq_name, ending_seq_name, co
                 # get candidates in a list
                 cand_sequence_token_lst  = msa_query_sample(msa_batch_tokens)
 
+                masked_positions = {int(p) for p in target_pos_change}
+                toss_sequences = []
+                toss_changed = 0
+                toss_leaked = 0
+
                 # evaluate candidate
                 for candidate_idx in range(len(cand_sequence_token_lst)): # 5 candidates
                     candidate_state_id   = str(current_state_id) + '-' + str(it)  + ':' + str(toss) + ':' + str(candidate_idx)
@@ -150,6 +203,20 @@ def iterative_sampling(full_context_file, starting_seq_name, ending_seq_name, co
                 
                     # get changed information
                     actual_pos_changed, num_pos_changed = tokens_changed(current_sequence_token, cand_sequence_token)
+
+                    # Constraint leakage: nothing in the algorithm pins an
+                    # UNMASKED column to its current residue -- `top_k_samples`
+                    # and `sample_candidates` both beam-search every column, and
+                    # only BERT-style copying keeps them still in practice. The
+                    # set of columns that may be masked is model-independent;
+                    # the set that actually changes is not, so it is counted
+                    # rather than assumed away.
+                    toss_sequences.append(cand_sequence)
+                    toss_changed += num_pos_changed
+                    toss_leaked += sum(
+                        1 for position in actual_pos_changed
+                        if position not in masked_positions
+                    )
 
                     # create candidate state
                     candidate_state = {
@@ -182,6 +249,12 @@ def iterative_sampling(full_context_file, starting_seq_name, ending_seq_name, co
                         print(f" 🎉 Candidate {candidate_idx} converged with score {cand_score}.")
                     else:
                         this_beam_candidates.append(candidate_state)
+
+                row = _degeneracy_row(
+                    it, beam_idx, toss_sequences, num_pos_mask, toss_changed, toss_leaked
+                )
+                if row is not None:
+                    degeneracy_rows.append(row)
 
             # use the simulated annealing criteria to accept or reject candidates
             accepted_beam_candidates = accept_or_reject_beam_candidates(this_beam_candidates, current_state, t, it)
@@ -230,6 +303,13 @@ def iterative_sampling(full_context_file, starting_seq_name, ending_seq_name, co
         'tgt_pos_diff_aa': None,
         'converged':  converged_status,
         'status': 'END' })
+
+    # lets save the per-step degeneracy table
+    with open(degeneracy_file, "w") as f:
+        f.write("\t".join(DEGENERACY_COLUMNS) + "\n")
+        for row in degeneracy_rows:
+            f.write("\t".join(str(value) for value in row) + "\n")
+    print(f"✅ Degeneracy table ({len(degeneracy_rows)} rows) saved to {degeneracy_file}")
 
     # lets save path history
     with open(f"{output_file_path}beam_evol_msat_history_{random_seed}.pkl", "wb") as f:

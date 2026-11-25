@@ -15,8 +15,10 @@ import h5py
 from pysam import FastxFile
 from src.utils.evaluator import PathwayEvaluator
 from src.utils.model_loader import ModelLoader
+from src.utils import esm2_backend
 from config.settings import DEVICE, MASK_ID, DISTANCE_TEMP, \
-    ENTROPY_THRESHOLD_FILTER, GENERATOR_METHOD, N_CANDIDATES, P_MASK
+    ENTROPY_THRESHOLD_FILTER, GENERATOR_METHOD, N_CANDIDATES, P_MASK, \
+    GENERATOR_BACKEND, ESM2_UNGAPPED_FILL
 
 
 deletekeys = dict.fromkeys(string.ascii_lowercase)
@@ -24,20 +26,24 @@ deletekeys["."] = None
 deletekeys["*"] = None
 translation = str.maketrans(deletekeys)
 
-# load the generator + alphabet
-msa_transformer, msa_alphabet = ModelLoader.get_model()
+# The alphabet, with no checkpoint read: both arms share these ids, and the
+# ESM-2 arm must be able to run on a machine that has no MSA-Transformer
+# checkpoint at all. The models themselves load lazily, inside the two sampling
+# functions below.
+msa_alphabet = ModelLoader.get_alphabet()
 msa_batch_converter = msa_alphabet.get_batch_converter()
 idx_list = msa_alphabet.tok_to_idx # reference dict for model token
 aa_list  = {v: k for k,v in idx_list.items()}
-valid_aa_vals = torch.tensor([ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 
+valid_aa_vals = torch.tensor([ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
                              18, 19, 20, 21, 22, 23, 30],dtype=torch.int64)
 
 def get_row_col_attention(msa_batch_tokens):
+    msa_transformer, _ = ModelLoader.get_msa_model()
     with torch.no_grad():
         results = msa_transformer(msa_batch_tokens.to(DEVICE),repr_layers=[12],return_contacts=False, need_head_weights=True)
         row_attn = results['row_attentions'][0].to('cpu').numpy() # 12,12,734,734
         avg_row_attn = np.mean(row_attn, axis=(0,1)) # 734,734
-    return avg_row_attn 
+    return avg_row_attn
 
 def apply_apc(attn_matrix):
     """
@@ -82,18 +88,54 @@ def top_k_samples(prob_matrix, k):
     
     return beam
 
+def esm2_query_sample(query_tokens):
+    """Fill the masked columns of one alignment row with ESM-2.
+
+    Same contract as `msa_query_sample`: a list of `(L+1,)` token tensors in
+    protmixy's `[cls] + one token per alignment column` layout, so the beam
+    cannot tell the two arms apart.
+
+    Three differences from the MSA path, each measured rather than assumed:
+
+    * **no MSA axis** -- ESM-2 reads one sequence, so the logits are `(1, T, 33)`
+      and there is no `[:, 0, :, :]` slice;
+    * **gaps are dropped before the model sees them** and restored by column map
+      (`ESM2_UNGAPPED_FILL`), because ESM-2 saw ungapped UniRef50 and the
+      committed contexts are 54-68 % gap;
+    * **log space, not a product.** `top_k_samples` multiplies per-position
+      probabilities and reaches exactly 0.0 below a mean probability of 0.362,
+      after which every candidate's tail fills with `<cls>`. The MSA Transformer
+      reconstructs a sequence from its own input context and stays above that
+      floor; ESM-2 unconditioned sits near 0.1 and would not.
+    """
+    model, _ = ModelLoader.get_esm2_model()
+    logits = esm2_backend.query_logits(
+        model, query_tokens, device=DEVICE, ungapped=ESM2_UNGAPPED_FILL
+    )
+    return esm2_backend.fill_candidates(logits, N_CANDIDATES)
+
 def msa_query_sample(msa_batch_tokens):
     """
-    Sample a sequence from the MSA-Transformer model using the provided batch tokens.
-    
+    Sample a sequence from the generator using the provided batch tokens.
+
+    Dispatches on GENERATOR_BACKEND: the MSA Transformer (the published method)
+    or ESM-2 (the single-sequence baseline). The ESM-2 arm reads row 0 of the
+    batch, which `msat_beam_evolver` has already overwritten with the masked
+    query -- the context rows are MSA conditioning and are precisely what the
+    baseline is defined not to see.
+
     Args:
         msa_batch_tokens (torch.Tensor): Batch of tokenized MSA sequences
-        
+
     Returns:
         list of torch.Tensor: Sampled sequence tokens from the model
     """
     #print(f"🧬 Sampling candidates from MSA-Transformer...")
-    
+
+    if GENERATOR_BACKEND == 'esm2':
+        return esm2_query_sample(msa_batch_tokens[0, 0, :])
+
+    msa_transformer, _ = ModelLoader.get_msa_model()
     with torch.no_grad():
         results_logits  = msa_transformer(msa_batch_tokens.to(DEVICE),repr_layers=[12],return_contacts=False)['logits'] # 1, total_seqs, 734, 33
         #print(f"🧬 Model logits shape: {results_logits.shape}")
